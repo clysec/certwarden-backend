@@ -24,6 +24,7 @@ type App interface {
 	GetAuthStorage() Storage
 	GetShutdownContext() context.Context
 	GetShutdownWaitGroup() *sync.WaitGroup
+	GetOidcConfig() map[string]string
 }
 
 type User struct {
@@ -49,6 +50,7 @@ type Service struct {
 	accessJwtSecret  []byte
 	sessionJwtSecret []byte
 	sessionManager   *sessionManager
+	oidcConfig       map[string]string
 }
 
 // NewService creates a new users service
@@ -91,6 +93,8 @@ func NewService(app App) (*Service, error) {
 	if err != nil {
 		return nil, errServiceComponent
 	}
+
+	service.oidcConfig = app.GetOidcConfig()
 
 	// create session manager
 	service.sessionManager = newSessionManager()

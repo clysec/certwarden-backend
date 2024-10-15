@@ -34,6 +34,8 @@ func (app *Application) makeRouterAndRoutes() {
 	// app auth - insecure as these give clients the access_token to access secure routes
 	// validates with user/password
 	router.handleAPIRouteInsecure(http.MethodPost, apiUrlPath+"/v1/app/auth/login", app.auth.LoginUsingUserPwPayload)
+	router.handleAPIRouteInsecure(http.MethodPost, apiUrlPath+"/v1/app/auth/oidc", app.auth.StartOidcAuthProcess)
+	router.handleAPIRouteInsecure(http.MethodPost, apiUrlPath+"/v1/app/auth/oidclogin", app.auth.LoginUserWithOidc)
 	// validates with cookie
 	router.handleAPIRouteInsecure(http.MethodPost, apiUrlPath+"/v1/app/auth/refresh", app.auth.RefreshUsingCookie)
 

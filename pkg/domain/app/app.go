@@ -192,3 +192,7 @@ func (app *Application) GetShutdownContext() context.Context {
 func (app *Application) GetShutdownWaitGroup() *sync.WaitGroup {
 	return app.shutdownWaitgroup
 }
+
+func (app *Application) GetOidcConfig() map[string]string {
+	return app.config.OidcConfig
+}

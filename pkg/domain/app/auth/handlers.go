@@ -1,10 +1,17 @@
 package auth
 
 import (
+	"certwarden-backend/pkg/httpclient"
 	"certwarden-backend/pkg/output"
+	"certwarden-backend/pkg/randomness"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"golang.org/x/crypto/bcrypt"
 )
@@ -21,6 +28,32 @@ type authResponse struct {
 type loginPayload struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
+}
+
+type OidcResponse struct {
+	RedirectUrl string `json:"redirect_url"`
+	State       string `json:"state"`
+	Verifier    string `json:"verifier"`
+	Challenge   string `json:"challenge"`
+	CallbackUrl string `json:"callback_url"`
+}
+
+type OidcFormattedResponse struct {
+	StatusCode int          `json:"status_code"`
+	Message    string       `json:"message"`
+	Data       OidcResponse `json:"authorization"`
+}
+
+type OidcLoginPayload struct {
+	State           string       `json:"state"`
+	SessionState    string       `json:"session_state"`
+	Code            string       `json:"code"`
+	Issuer          string       `json:"issuer"`
+	OriginalRequest OidcResponse `json:"original_request"`
+}
+
+func (or *OidcFormattedResponse) HttpStatusCode() int {
+	return http.StatusOK
 }
 
 // LoginUsingUserPwPayload takes the loginPayload, looks up the username in storage
@@ -62,6 +95,168 @@ func (service *Service) LoginUsingUserPwPayload(w http.ResponseWriter, r *http.R
 			return output.ErrInternal
 		}
 
+		// save auth's session in manager
+		err = service.sessionManager.new(auth.SessionTokenClaims)
+		if err != nil {
+			service.logger.Errorf("client %s: login failed (internal error: %s)", r.RemoteAddr, err)
+			return output.ErrUnauthorized
+		}
+
+		// return response to client
+		response := &authResponse{}
+		response.StatusCode = http.StatusOK
+		response.Message = fmt.Sprintf("user '%s' logged in", auth.SessionTokenClaims.Subject)
+		response.Authorization = auth
+
+		// write response
+		auth.writeSessionCookie(w)
+		err = service.output.WriteJSON(w, response)
+		if err != nil {
+			service.logger.Errorf("failed to write json (%s)", err)
+			return output.ErrWriteJsonError
+		}
+
+		// log success
+		service.logger.Infof("client %s: user '%s' logged in", r.RemoteAddr, auth.SessionTokenClaims.Subject)
+
+		return nil
+	}()
+
+	// if err, delete session cookie and return err
+	if outErr != nil {
+		service.deleteSessionCookie(w)
+		return outErr
+	}
+
+	return nil
+}
+
+// LoginUsingUserPwPayload takes the loginPayload, looks up the username in storage
+// and validates the password. If so, an Access Token is returned in JSON and a refresh
+// token is sent in a cookie.
+func (service *Service) StartOidcAuthProcess(w http.ResponseWriter, r *http.Request) *output.Error {
+	// wrap handler to easily check err and delete cookies
+	outErr := func() *output.Error {
+
+		oidcIssuer := service.oidcConfig["issuerUrl"]
+		oidcClientId := service.oidcConfig["clientId"]
+
+		if oidcIssuer == "" || oidcClientId == "" {
+			return output.ErrUnauthorized
+		}
+
+		codeVerifier, err := randomness.RandomHexBytes(32)
+		if err != nil {
+			return output.ErrInternal
+		}
+
+		sha2 := sha256.New()
+		io.WriteString(sha2, codeVerifier)
+		codeChallenge := base64.RawURLEncoding.EncodeToString(sha2.Sum(nil))
+
+		state, stateErr := randomness.RandomHexBytes(24)
+		if stateErr != nil {
+			return output.ErrInternal
+		}
+
+		authorizationUrl := service.oidcConfig["authorizationUrl"]
+		if authorizationUrl == "" {
+			return output.ErrInternal
+		}
+
+		redirectUrl := fmt.Sprintf("%s?client_id=%s&response_type=code&scope=openid&state=%s&code_challenge=%s&code_challenge_method=S256", authorizationUrl, oidcClientId, state, codeChallenge)
+
+		response := &OidcFormattedResponse{
+			StatusCode: http.StatusOK,
+			Message:    "user started oidc auth process",
+			Data: OidcResponse{
+				RedirectUrl: redirectUrl,
+				State:       state,
+				Verifier:    codeVerifier,
+				Challenge:   codeChallenge,
+			},
+		}
+
+		err = service.output.WriteJSON(w, response)
+		if err != nil {
+			service.logger.Errorf("failed to write json (%s)", err)
+			return output.ErrWriteJsonError
+		}
+
+		service.logger.Infof("client %s: user started oidc auth process", r.RemoteAddr)
+		return nil
+	}()
+
+	// if err, delete session cookie and return err
+	if outErr != nil {
+		service.deleteSessionCookie(w)
+		return outErr
+	}
+
+	return nil
+}
+
+func (service *Service) LoginUserWithOidc(w http.ResponseWriter, r *http.Request) *output.Error {
+	outErr := func() *output.Error {
+		oidcIssuer := service.oidcConfig["issuerUrl"]
+		oidcClientId := service.oidcConfig["clientId"]
+		// oidcClientSecret := service.oidcConfig["clientSecret"]
+
+		if oidcIssuer == "" || oidcClientId == "" {
+			return output.ErrUnauthorized
+		}
+
+		request := OidcLoginPayload{}
+
+		err := json.NewDecoder(r.Body).Decode(&request)
+		if err != nil {
+			return output.ErrUnauthorized
+		}
+
+		client := httpclient.New("oidc-client/1.0")
+
+		body := fmt.Sprintf("grant_type=authorization_code&client_id=%s&code_verifier=%s&code=%s&redirect_uri=%s", oidcClientId, url.QueryEscape(request.OriginalRequest.Verifier), url.QueryEscape(request.Code), request.OriginalRequest.CallbackUrl)
+		tokenResponse, err := client.Post(service.oidcConfig["tokenUrl"], "application/x-www-form-urlencoded", strings.NewReader(body))
+		if err != nil {
+			return output.ErrInternal
+		}
+
+		if tokenResponse.StatusCode != http.StatusOK {
+			switch tokenResponse.StatusCode {
+			case http.StatusInternalServerError:
+				return output.ErrInternal
+			case http.StatusUnauthorized, http.StatusForbidden:
+				return output.ErrUnauthorized
+			default:
+				data, err := io.ReadAll(tokenResponse.Body)
+				if err != nil {
+					return output.ErrInternal
+				}
+				fmt.Println(string(data))
+				return output.ErrInternal
+			}
+		}
+
+		responseItem := map[string]interface{}{}
+		err = json.NewDecoder(tokenResponse.Body).Decode(&responseItem)
+		if err != nil {
+			return output.ErrInternal
+		}
+
+		fmt.Println(responseItem)
+
+		user, err := service.storage.GetOneUserByName("admin")
+		if err != nil {
+			service.logger.Infof("client %s: login failed (bad username: %s)", r.RemoteAddr, err)
+			return output.ErrUnauthorized
+		}
+
+		// user and password now verified, make auth
+		auth, err := service.newAuthorization(user.Username)
+		if err != nil {
+			service.logger.Errorf("client %s: login failed (internal error: %s)", r.RemoteAddr, err)
+			return output.ErrInternal
+		}
 		// save auth's session in manager
 		err = service.sessionManager.new(auth.SessionTokenClaims)
 		if err != nil {

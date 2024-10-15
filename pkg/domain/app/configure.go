@@ -8,6 +8,8 @@ import (
 	"certwarden-backend/pkg/domain/app/backup"
 	"certwarden-backend/pkg/domain/app/updater"
 	"certwarden-backend/pkg/domain/orders"
+	"certwarden-backend/pkg/httpclient"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -52,6 +54,7 @@ type config struct {
 	Updater                   updater.Config    `yaml:"updater"`
 	Orders                    orders.Config     `yaml:"orders"`
 	Challenges                challenges.Config `yaml:"challenges"`
+	OidcConfig                map[string]string `yaml:"oidc"`
 }
 
 // httpAddress() returns formatted http server address string
@@ -333,5 +336,77 @@ func (app *Application) setDefaultConfigValues() {
 				Port: http01Port,
 			},
 		}}
+	}
+
+	if app.config.OidcConfig == nil {
+		app.config.OidcConfig = make(map[string]string)
+		if os.Getenv("OIDC_ISSUER_URL") != "" {
+			if os.Getenv("OIDC_CLIENT_ID") != "" {
+				app.config.OidcConfig["issuerUrl"] = os.Getenv("OIDC_ISSUER_URL")
+				app.config.OidcConfig["clientId"] = os.Getenv("OIDC_CLIENT_ID")
+
+				authorizationUrl := os.Getenv("OIDC_AUTHORIZATION_URL")
+				tokenUrl := os.Getenv("OIDC_TOKEN_URL")
+				jwksUrl := os.Getenv("OIDC_JWKS_URL")
+				userInfoUrl := os.Getenv("OIDC_USERINFO_URL")
+
+				if authorizationUrl == "" || tokenUrl == "" || userInfoUrl == "" || jwksUrl == "" {
+					if app.httpClient == nil {
+						app.httpClient = httpclient.New("oidc-fetch-information/1.0")
+					}
+					response, err := app.httpClient.Get(app.config.OidcConfig["issuerUrl"] + "/.well-known/openid-configuration")
+					if err != nil {
+						app.logger.Errorf("Failed to get OpenID configuration from %s: %s", app.config.OidcConfig["issuerUrl"], err)
+						return
+					}
+
+					var responseItem map[string]interface{}
+					err = json.NewDecoder(response.Body).Decode(&responseItem)
+					if err != nil {
+						app.logger.Errorf("Failed to unmarshal OpenID configuration from %s: %s", app.config.OidcConfig["issuerUrl"], err)
+						return
+					}
+
+					if authorizationUrl == "" {
+						authorizationUrl, ok := responseItem["authorization_endpoint"].(string)
+						if !ok {
+							app.logger.Errorf("Authorization URL not found in OpenID configuration from %s", app.config.OidcConfig["issuerUrl"])
+							return
+						}
+						app.config.OidcConfig["authorizationUrl"] = authorizationUrl
+					}
+
+					if tokenUrl == "" {
+						tokenUrl, ok := responseItem["token_endpoint"].(string)
+						if !ok {
+							app.logger.Errorf("Token URL not found in OpenID configuration from %s", app.config.OidcConfig["issuerUrl"])
+							return
+						}
+						app.config.OidcConfig["tokenUrl"] = tokenUrl
+					}
+
+					if jwksUrl == "" {
+						jwksUrl, ok := responseItem["jwks_uri"].(string)
+						if !ok {
+							app.logger.Errorf("JWKS URL not found in OpenID configuration from %s", app.config.OidcConfig["issuerUrl"])
+						}
+						app.config.OidcConfig["jwksUrl"] = jwksUrl
+					}
+
+					if userInfoUrl == "" {
+						userInfoUrl, ok := responseItem["userinfo_endpoint"].(string)
+						if !ok {
+							app.logger.Errorf("User Info URL not found in OpenID configuration from %s", app.config.OidcConfig["issuerUrl"])
+							return
+						}
+						app.config.OidcConfig["userInfoUrl"] = userInfoUrl
+					}
+
+					app.logger.Infof("OIDC configuration fetched from %s", app.config.OidcConfig["issuerUrl"])
+				}
+
+			}
+
+		}
 	}
 }
